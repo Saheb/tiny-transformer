@@ -570,7 +570,7 @@ def loss_fn(params, inputs, targets, batch_size, vocab, vocab_size=10000, dropou
     - Computes loss on the full sequence, using a mask for padding.
     """
     current_batch_size = targets.shape[0]
-    sos_id = vocab['<sos>']
+    sos_id = vocab['<SOS>']
     
     # 1. Create the decoder input by shifting the original targets right.
     dec_input = jnp.concatenate([jnp.full((current_batch_size, 1), sos_id), targets[:, :-1]], axis=1)
@@ -692,7 +692,7 @@ def train(params, optimizer, opt_state, data_iter, val_en_tokenized, val_ru_targ
     step_count = 0
     best_val_loss = float('inf')
     early_stopping = False
-    sos_id = vocab['<sos>']
+    sos_id = vocab['<SOS>']
     
     # lr_scheduler_state = ReduceLROnPlateauState(
     #     learning_rate=opt_state[1].hyperparams['learning_rate'],
@@ -962,7 +962,7 @@ if __name__ == "__main__":
 
     timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
 
-    plot_dir = 'plot'
+    plot_dir = 'plots'
     os.makedirs(plot_dir, exist_ok=True)
 
     filename = f'metrics_plot_{final_steps}_steps_{timestamp_str}.png'
