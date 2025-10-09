@@ -16,28 +16,34 @@ from tqdm import tqdm
 # SECTION 1: DATA PROCESSING FUNCTIONS
 # ==============================================================================
 
+# def normalize_text(text: str) -> str:
+#     """
+#     Normalizes text by transliterating, converting to lowercase, and removing punctuation.
+#     """
+#     normalized = translit(text, 'ru', reversed=True).lower()
+#     normalized = re.sub(r"[^a-zA-Zа-яА-Я0-9']+", " ", normalized)
+#     return normalized.strip()
+
 def normalize_text(text: str) -> str:
-    """
-    Normalizes text by transliterating, converting to lowercase, and removing punctuation.
-    """
-    normalized = translit(text, 'ru', reversed=True).lower()
-    normalized = re.sub(r"[^a-zA-Zа-яА-Я0-9']+", " ", normalized)
-    return normalized.strip()
+    return re.sub(r"[^a-zA-Z0-9']+", " ", text.lower()).strip()
 
 def load_dataset_and_vocab(split: str = "train", max_vocab_size: int = 20000):
     """
     Loads dataset from Hugging Face and builds a stable, correctly-sized vocabulary.
     """
-    dataset = load_dataset("opus_books", "en-ru", split=split)
-    print(f"Loaded {dataset.num_rows} samples for split: {split}")
+    # dataset = load_dataset("opus_books", "en-ru", split=split)
+    # print(f"Loaded {dataset.num_rows} samples for split: {split}")
+
+    dataset = load_dataset("wmt14", "ru-en", split="train[:1%]")  # start with small subset
+    print(f"Loaded {dataset.num_rows} samples for split: train[:1%]")
 
     en_sentences = [normalize_text(pair['en']) for pair in dataset['translation']]
     ru_sentences = [normalize_text(pair['ru']) for pair in dataset['translation']]
 
     special_tokens = ['<PAD>', '<UNK>', '<EOS>', '<SOS>']
     vocab = {token: i for i, token in enumerate(special_tokens)}
-    
-    word_counts = Counter(' '.join(en_sentences + ru_sentences).split())
+
+    word_counts = Counter(" ".join(en_sentences + ru_sentences).split())
     
     for word, _ in word_counts.most_common(max_vocab_size - len(special_tokens)):
         if word not in vocab:
@@ -153,77 +159,120 @@ def transformer_encoder(emb, params, keys, n_layers, **kwargs):
     final_norm_params = params['final_norm']
     return layer_norm(x, scale=final_norm_params['scale'], offset=final_norm_params['offset'])
 
-def decoder_layer(dec_emb, enc_output, params, key, n_heads, d_model, d_ff, dropout_rate, training, **kwargs):
+def decoder_layer(dec_emb, enc_output, params, key, n_heads, d_model, d_ff, dropout_rate, training, debug=False, **kwargs):
+    """
+    Decoder layer: self-attention -> cross-attention -> feed-forward.
+    - dec_emb: [B, T_dec, D]
+    - enc_output: [B, T_enc, D]
+    - kwargs may contain 'dec_input' (token ids) and 'enc_input' (token ids) and 'vocab'
+    """
     batch_size, max_len, _ = dec_emb.shape
-    
+
+    # -------------------------
+    # 1) Decoder self-attention
+    # -------------------------
     norm1_params = params['norm1']
     norm1 = layer_norm(dec_emb, scale=norm1_params['scale'], offset=norm1_params['offset'])
+
     W_q, W_k, W_v, W_o = params['self_attention'].values()
     Q = jnp.dot(norm1, W_q).reshape(batch_size, max_len, n_heads, d_model // n_heads).transpose(0, 2, 1, 3)
     K = jnp.dot(norm1, W_k).reshape(batch_size, max_len, n_heads, d_model // n_heads).transpose(0, 2, 1, 3)
     V = jnp.dot(norm1, W_v).reshape(batch_size, max_len, n_heads, d_model // n_heads).transpose(0, 2, 1, 3)
-    
+
+    # Scaled dot-product
     E = jnp.matmul(Q, K.transpose(0, 1, 3, 2)) / jnp.sqrt(d_model // n_heads)
+
+    # masks: pad_mask (B,1,1,T_dec) & look-ahead (1,1,T_dec,T_dec) -> broadcast to (B, n_heads, T_dec, T_dec)
     dec_input = kwargs.get("dec_input")
-    vocab = kwargs["vocab"]
-    pad_mask = (dec_input != vocab["<PAD>"])[:, None, None, :]
-    look_ahead_mask = jnp.tril(jnp.ones((1, 1, max_len, max_len), dtype=bool))
+    vocab = kwargs.get("vocab")
+    if dec_input is None or vocab is None:
+        raise ValueError("decoder_layer requires dec_input and vocab in kwargs for masking")
+
+    pad_mask = (dec_input != vocab["<PAD>"])[:, None, None, :]   # [B,1,1,T_dec]
+    look_ahead_mask = jnp.tril(jnp.ones((1, 1, max_len, max_len), dtype=bool))  # [1,1,T_dec,T_dec]
     mask = pad_mask & look_ahead_mask
     E = jnp.where(mask, E, -1e9)
-    
+
     A = jax.nn.softmax(E, axis=-1)
+
+    # optional attention dropout
+    if training and dropout_rate > 0.0:
+        key, subkey = jax.random.split(key)
+        A = A * jax.random.bernoulli(subkey, 1 - dropout_rate, A.shape) / (1 - dropout_rate)
+
     Y = jnp.matmul(A, V).transpose(0, 2, 1, 3).reshape(batch_size, max_len, d_model)
     self_attention_out = jnp.dot(Y, W_o)
     residual1 = dec_emb + self_attention_out
-    
+
+    # -------------------------
+    # 2) Cross-attention (decoder -> encoder)
+    # -------------------------
     norm2_params = params['norm2']
     norm2 = layer_norm(residual1, scale=norm2_params['scale'], offset=norm2_params['offset'])
+
     W_cq, W_ck, W_cv, W_co = params['cross_attention'].values()
     Q = jnp.dot(norm2, W_cq).reshape(batch_size, max_len, n_heads, d_model // n_heads).transpose(0, 2, 1, 3)
     K = jnp.dot(enc_output, W_ck).reshape(batch_size, -1, n_heads, d_model // n_heads).transpose(0, 2, 1, 3)
     V = jnp.dot(enc_output, W_cv).reshape(batch_size, -1, n_heads, d_model // n_heads).transpose(0, 2, 1, 3)
-    
+
     E = jnp.matmul(Q, K.transpose(0, 1, 3, 2)) / jnp.sqrt(d_model // n_heads)
+
+    # Mask encoder padding tokens if enc_input provided
     enc_input = kwargs.get("enc_input")
     if enc_input is not None:
-        enc_pad_mask = (enc_input != vocab["<PAD>"])[:, None, None, :]
-        E = jnp.where(enc_pad_mask, E, -1e9).astype(jnp.float32)
+        enc_pad_mask = (enc_input != vocab["<PAD>"])[:, None, None, :]   # [B,1,1,T_enc]
+        E = jnp.where(enc_pad_mask, E, -1e9)
 
     A = jax.nn.softmax(E, axis=-1)
+
+    # optional attention dropout
+    if training and dropout_rate > 0.0:
+        key, subkey = jax.random.split(key)
+        A = A * jax.random.bernoulli(subkey, 1 - dropout_rate, A.shape) / (1 - dropout_rate)
+
     Y = jnp.matmul(A, V).transpose(0, 2, 1, 3).reshape(batch_size, max_len, d_model)
     cross_attention_out = jnp.dot(Y, W_co)
     residual2 = residual1 + cross_attention_out
-    
+
+    # -------------------------
+    # 3) Feed-forward
+    # -------------------------
     norm3_params = params['norm3']
     norm3 = layer_norm(residual2, scale=norm3_params['scale'], offset=norm3_params['offset'])
-    # W1, b1, W2, b2 = params['feed_forward'].values()
 
     ffn_params = params['feed_forward']
     W1, b1, W2, b2 = ffn_params['W1'], ffn_params['b1'], ffn_params['W2'], ffn_params['b2']
 
-    # Explicitly broadcast b1 and b2
     ffn_hidden = jax.nn.relu(jnp.dot(norm3, W1) + b1[None, None, :])
     ffn_out = jnp.dot(ffn_hidden, W2) + b2[None, None, :]
 
-    # ffn_out = jnp.dot(jax.nn.relu(jnp.dot(norm3, W1) + b1), W2) + b2
-    
-    if training:
+    if training and dropout_rate > 0.0:
         key, subkey = jax.random.split(key)
         ffn_out = ffn_out * jax.random.bernoulli(subkey, 1 - dropout_rate, ffn_out.shape) / (1 - dropout_rate)
-        
+
     final_out = residual2 + ffn_out
+
+    # Optional debug prints (per-layer)
+    if debug:
+        try:
+            mean_attn = float(jnp.mean(A))
+            max_attn = float(jnp.max(A))
+            print(f"Decoder layer cross-attn mean={mean_attn:.6f} max={max_attn:.6f}")
+        except Exception:
+            pass
+
     return final_out
 
-def transformer_decoder(dec_emb, enc_output, params, keys, n_layers, **kwargs):
+def transformer_decoder(dec_emb, enc_output, params, keys, n_layers, debug=False, **kwargs):
     x = dec_emb
     for i in range(n_layers):
-        x = decoder_layer(x, enc_output, params['layers'][i], keys[i], **kwargs)
+        x = decoder_layer(x, enc_output, params['layers'][i], keys[i], debug=debug, **kwargs)
     final_norm_params = params['final_norm']
     return layer_norm(x, scale=final_norm_params['scale'], offset=final_norm_params['offset'])
 
 def forward(params, enc_input, dec_input,
             vocab_size, d_model, n_layers, n_heads, d_ff,
-            dropout_rate, training, key=None, vocab=None):
+            dropout_rate, training, key=None, vocab=None, debug=False):
     if key is None:
         key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, n_layers * 2)
@@ -236,10 +285,18 @@ def forward(params, enc_input, dec_input,
     dec_emb += positional_embeddings(max_len=dec_input.shape[1], d_model=d_model)
     
     enc_output = transformer_encoder(enc_emb, params['encoder'], enc_keys, n_layers=n_layers, n_heads=n_heads, d_model=d_model, d_ff=d_ff, dropout_rate=dropout_rate, training=training, enc_input=enc_input, vocab=vocab)
-    dec_output = transformer_decoder(dec_emb, enc_output, params['decoder'], dec_keys, n_layers=n_layers, n_heads=n_heads, d_model=d_model, d_ff=d_ff, dropout_rate=dropout_rate, training=training, enc_input=enc_input, dec_input=dec_input, vocab=vocab)
+    dec_output = transformer_decoder(dec_emb, enc_output, params['decoder'], dec_keys, n_layers=n_layers, n_heads=n_heads, d_model=d_model, d_ff=d_ff, dropout_rate=dropout_rate, training=training, debug=debug, enc_input=enc_input, dec_input=dec_input, vocab=vocab)
     
     logits = jnp.dot(dec_output, params['output']['W_out'])
     predictions = jnp.argmax(logits, axis=-1)
+
+    if debug:
+        probs = jax.nn.softmax(logits[0, -1])
+        topk_idx = jnp.argsort(probs)[-5:][::-1]
+        topk_words = [list(vocab.keys())[int(i)] for i in topk_idx]
+        topk_probs = [float(probs[i]) for i in topk_idx]
+        print(f"[DEBUG] Top-5 next tokens: {list(zip(topk_words, topk_probs))}")
+
     return logits, predictions
 
 def init_params(key, vocab_size, d_model, d_ff, n_heads, n_layers):
@@ -315,15 +372,39 @@ def loss_fn(params, batch_input, batch_targets, vocab, dropout_rate, key, traini
                     vocab=vocab,
                     **kwargs)
     
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, dec_target)
+    # loss = optax.softmax_cross_entropy_with_integer_labels(logits, dec_target)
+    loss = smoothed_loss(logits, dec_target, vocab)
     mask = (batch_targets != vocab['<PAD>'])
     
-    return jnp.sum(loss * mask) / jnp.sum(mask)
+    return jnp.sum((loss * mask) / (jnp.sum(mask) + 1e-8))
 
 def compute_accuracy(predictions, targets, vocab):
     mask = (targets != vocab['<PAD>'])
-    accuracy = jnp.sum((predictions == targets) * mask) / jnp.sum(mask)
+    accuracy = jnp.sum((predictions == targets) * mask) / (jnp.sum(mask) + 1e-8)
     return accuracy.item()
+
+def smoothed_loss(logits, targets, vocab, smoothing=0.1):
+    num_classes = logits.shape[-1]
+    confidence = 1.0 - smoothing
+    low_conf = smoothing / num_classes
+    targets_onehot = jax.nn.one_hot(targets, num_classes)
+    soft_targets = confidence * targets_onehot + low_conf
+    log_probs = jax.nn.log_softmax(logits)
+    loss = -jnp.sum(soft_targets * log_probs, axis=-1)
+    mask = (targets != vocab['<PAD>'])
+    return jnp.sum(loss * mask) / jnp.sum(mask)
+
+def quick_eval(n=5):
+    print("\n📊 Quick Eval on random samples\n")
+    it = get_data_iterator(train_en_tok, train_ru_tok, 1, jax.random.PRNGKey(123))
+    for _ in range(n):
+        x, y = next(it)
+        sos_id = vocab["<SOS>"]
+        dec_input = jnp.concatenate([jnp.full((1, 1), sos_id), y[:, :-1]], axis=1)
+        logits, preds = forward(params, x, dec_input, training=False, dropout_rate=0.0, **model_args)
+        inp = " ".join([id2tok.get(int(i), "") for i in x[0] if id2tok.get(int(i)) not in ("<PAD>", "<EOS>")])
+        out = " ".join([id2tok.get(int(i), "") for i in preds[0] if id2tok.get(int(i)) not in ("<PAD>", "<EOS>")])
+        print(f"🟦 {inp}\n🟨 {out}\n{'─'*60}")
 
 # --- MAIN EXECUTION ---
 
@@ -337,11 +418,11 @@ if __name__ == "__main__":
         print(f"Could not initialize JAX GPU backend: {e}. Falling back to CPU.")
 
     # Hyperparameters
-    MAX_STEPS = 500
-    D_MODEL = 128
+    MAX_STEPS = 2000
+    D_MODEL = 256
     D_FF = D_MODEL * 4
     DROPOUT_RATE = 0.1
-    N_LAYERS = 2
+    N_LAYERS = 4
     N_HEADS = 8
     LEARNING_RATE = 1e-4
     BATCH_SIZE = 32
@@ -354,10 +435,6 @@ if __name__ == "__main__":
     # D_MODEL = 64            # ✅ smaller model for faster compile
     # N_LAYERS = 1            # ✅ one encoder, one decoder
     # N_HEADS = 4             # ✅ simpler attention
-
-    MAX_STEPS = 2000
-    BATCH_SIZE = 32
-    D_MODEL = 128
 
     
     print(f"""
@@ -378,21 +455,59 @@ if __name__ == "__main__":
     key, data_key, params_key = jax.random.split(key, 3)
     
     vocab, en_sentences, ru_sentences, vocab_size = load_dataset_and_vocab(max_vocab_size=20000)
+    ru_sentences = en_sentences.copy()
     
     train_size = int(0.8 * len(en_sentences))
     train_en_sents, val_en_sents = en_sentences[:train_size], en_sentences[train_size:]
     train_ru_sents, val_ru_sents = ru_sentences[:train_size], ru_sentences[train_size:]
 
     # testing
-    train_en_sents = train_en_sents[:100]
-    train_ru_sents = train_ru_sents[:100]
-    val_en_sents = val_en_sents[:40]
-    val_ru_sents = val_ru_sents[:40]
+    # MAX_STEPS = 3000
+    train_en_sents = train_en_sents[:1000]
+    train_ru_sents = train_ru_sents[:1000]
+    val_en_sents = val_en_sents[:200]
+    val_ru_sents = val_ru_sents[:200]
     
     train_en_tok = tokenize_and_pad(train_en_sents, vocab, MAX_LEN)
     train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, MAX_LEN)
     val_en_tok = tokenize_and_pad(val_en_sents, vocab, MAX_LEN)
     val_ru_tok = tokenize_and_pad(val_ru_sents, vocab, MAX_LEN)
+
+    # # --- Synthetic Copy Task ---
+    # toy_sentences = ["i am happy", "he is good", "they are here", "we are fine"]
+    # train_en_sents = toy_sentences
+    # train_ru_sents = toy_sentences  # identical targets
+
+    # vocab = {'<PAD>':0, '<UNK>':1, '<EOS>':2, '<SOS>':3,
+    #         'i':4, 'am':5, 'happy':6, 'he':7, 'is':8, 'good':9,
+    #         'they':10, 'are':11, 'here':12, 'we':13, 'fine':14}
+    # vocab_inv = {v: k for k, v in vocab.items()}
+    # vocab_size = len(vocab)
+
+    # train_en_tok = tokenize_and_pad(train_en_sents, vocab, max_len=8)
+    # train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, max_len=8)
+    # val_en_tok, val_ru_tok = train_en_tok, train_ru_tok
+
+    # import numpy as np
+
+    # VOCAB_SIZE = 50
+    # SEQ_LEN = 8
+    # N_SAMPLES = 2000
+
+    # np.random.seed(0)
+    # inputs = np.random.randint(4, VOCAB_SIZE, size=(N_SAMPLES, SEQ_LEN))
+    # targets = inputs.copy()
+
+    # # Replace a few with <EOS>/<PAD>
+    # targets[:, -1] = 2  # EOS
+    # vocab = {'<PAD>': 0, '<UNK>': 1, '<EOS>': 2, '<SOS>': 3}
+    # vocab.update({str(i): i for i in range(4, VOCAB_SIZE)})
+
+    # train_en_tok = jnp.array(inputs[:1600])
+    # train_ru_tok = jnp.array(targets[:1600])
+    # val_en_tok = jnp.array(inputs[1600:])
+    # val_ru_tok = jnp.array(targets[1600:])
+    
     
     def lr_schedule(step, base_lr=3e-4, warmup=1000):
         step = jnp.maximum(1, step)
@@ -407,7 +522,9 @@ if __name__ == "__main__":
     base_lr = 3e-4       # recommended base LR
 
     # create an optax schedule and optimizer ONCE
-    schedule = optax.linear_schedule(init_value=0.0, end_value=base_lr, transition_steps=warmup_steps)
+    # schedule = optax.linear_schedule(init_value=0.0, end_value=base_lr, transition_steps=warmup_steps)
+    # schedule = optax.cosine_decay_schedule(init_value=3e-4, decay_steps=10000)
+    schedule = optax.linear_schedule(3e-4, 1e-5, 5000)
     optimizer = optax.adam(schedule)
     opt_state = optimizer.init(params)
 
@@ -429,7 +546,7 @@ if __name__ == "__main__":
         new_params = optax.apply_updates(params, updates)
 
         # compute lr for logging: schedule returns a jnp scalar
-        lr = schedule(global_step)
+        lr = schedule(opt_state.count)
 
         return new_params, new_opt_state, loss, new_key, global_step + 1, lr
     
@@ -455,7 +572,9 @@ if __name__ == "__main__":
     for step in pbar:
         key, train_key = jax.random.split(key)
         batch_input, batch_targets = next(data_iter)
-        batch_targets = batch_targets.at[:, -1].set(vocab["<EOS>"])
+        # batch_targets = batch_targets.at[:, -1].set(vocab["<EOS>"])
+
+        # print("Sample target:", batch_targets[0])
 
         params, opt_state, loss, key, global_step, lr = train_step(
             params, opt_state, batch_input, batch_targets, train_key, global_step, vocab
@@ -466,8 +585,8 @@ if __name__ == "__main__":
             print("Sample target:", batch_targets[0])
             print(f"Initial loss: {float(loss):.4f}")
 
-        if (step + 1) % 1 == 0:
-            print(f"Step {step+1}: loss={float(loss):.4f}, lr={float(lr):.6f}")
+        # if (step + 1) % 1 == 0:
+        #     print(f"Step {step+1}: loss={float(loss):.4f}, lr={float(lr):.6f}")
 
         train_losses.append(float(loss))
 
@@ -476,6 +595,10 @@ if __name__ == "__main__":
             val_accuracies_batch = []
             val_iter = get_data_iterator(val_en_tok, val_ru_tok, BATCH_SIZE, data_key)
             num_val_batches = len(val_en_tok) // BATCH_SIZE
+
+            if num_val_batches == 0:
+                print("⚠️ No validation batches available — skipping eval")
+                continue
 
             for _ in range(num_val_batches):
                 val_batch_input, val_batch_targets = next(val_iter)
@@ -518,8 +641,48 @@ if __name__ == "__main__":
     
     plt.title(f'Training Metrics Over {MAX_STEPS} Steps')
     fig.tight_layout()
-    
-    test_sentences = ["i am", "she said", "he went to the city"]
+
+    import textwrap
+
+    def pretty_print_example(input_ids, target_ids, pred_ids, id2tok, max_len=20):
+        """Nicely format a single example."""
+        def decode(ids):
+            toks = [id2tok.get(int(i), "<UNK>") for i in ids if id2tok.get(int(i)) not in ("<PAD>", "<SOS>", "<EOS>")]
+            return " ".join(toks[:max_len])
+
+        input_txt  = decode(input_ids)
+        target_txt = decode(target_ids)
+        pred_txt   = decode(pred_ids)
+
+        print("─" * 80)
+        print(f"🟦 INPUT :  {textwrap.fill(input_txt,  70)}")
+        print(f"🟩 TARGET:  {textwrap.fill(target_txt, 70)}")
+        print(f"🟨 PRED  :  {textwrap.fill(pred_txt,   70)}")
+        print("─" * 80)
+        print()
+
+    # ------------------------------------------------------------------------------
+    # 1️⃣ Run a few random training examples
+    # ------------------------------------------------------------------------------
+    data_iter = get_data_iterator(train_en_tok, train_ru_tok, 1)
+    id2tok = {v: k for k, v in vocab.items()}
+
+    print("\n📘 RANDOM TRAINING EXAMPLES (Input → Target → Prediction)\n")
+
+    for _ in range(5):
+        x, y = next(data_iter)
+        sos_id = vocab["<SOS>"]
+        dec_input = jnp.concatenate([jnp.full((1, 1), sos_id), y[:, :-1]], axis=1)
+
+        logits, preds = forward(params, x, dec_input, training=False, dropout_rate=0.0, key=None, vocab=vocab, **model_args)
+        pretty_print_example(x[0], y[0], preds[0], id2tok)
+
+    # ------------------------------------------------------------------------------
+    # 2️⃣ Custom test sentences
+    # ------------------------------------------------------------------------------
+    print("\n📗 CUSTOM TEST SENTENCES\n")
+
+    test_sentences = ["i am", "she said", "he went to the city", "they are coming home"]
     test_tokens = text_to_token_ids(test_sentences, vocab, max_len=MAX_LEN)
 
     for sent, toks in zip(test_sentences, test_tokens):
@@ -527,7 +690,20 @@ if __name__ == "__main__":
         logits, preds = forward(params, toks[None, :], dec_input,
                                 training=False, dropout_rate=0.0,
                                 key=None, vocab=vocab, **model_args)
-        print(f"Input: {sent} → Output IDs: {preds[0, :10]}")
+        # decoded = " ".join([id2tok.get(int(i), "<UNK>") for i in preds[0]
+        #                     if id2tok.get(int(i)) not in ("<PAD>", "<SOS>", "<EOS>")])
+        decoded = []
+        for t in preds[0]:
+            word = id2tok[int(t)]
+            if word == "<EOS>":
+                break
+            if word not in ("<PAD>", "<SOS>"):
+                decoded.append(word)
+        print(" ".join(decoded))
+        print(f"💬 {sent:<30} →  {decoded}")
+
+
+    # quick_eval()
 
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     plot_dir = 'plots'
