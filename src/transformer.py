@@ -425,7 +425,7 @@ if __name__ == "__main__":
     N_LAYERS = 1
     N_HEADS = 8
     LEARNING_RATE = 1e-4
-    BATCH_SIZE = 2
+    BATCH_SIZE = 8
     MAX_LEN = 32
 
     # Testing Hyperparameters
@@ -441,39 +441,39 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(42)
     key, data_key, params_key = jax.random.split(key, 3)
     
-    # vocab, en_sentences, ru_sentences, vocab_size = load_dataset_and_vocab(max_vocab_size=20000)
-    # ru_sentences = en_sentences.copy()
+    vocab, en_sentences, ru_sentences, vocab_size = load_dataset_and_vocab(max_vocab_size=20000)
+    ru_sentences = en_sentences.copy()
     
-    # train_size = int(0.8 * len(en_sentences))
-    # train_en_sents, val_en_sents = en_sentences[:train_size], en_sentences[train_size:]
-    # train_ru_sents, val_ru_sents = ru_sentences[:train_size], ru_sentences[train_size:]
+    train_size = int(0.8 * len(en_sentences))
+    train_en_sents, val_en_sents = en_sentences[:train_size], en_sentences[train_size:]
+    train_ru_sents, val_ru_sents = ru_sentences[:train_size], ru_sentences[train_size:]
 
-    # # testing
-    # # MAX_STEPS = 3000
-    # train_en_sents = train_en_sents[:1000]
-    # train_ru_sents = train_ru_sents[:1000]
-    # val_en_sents = val_en_sents[:200]
-    # val_ru_sents = val_ru_sents[:200]
+    # testing
+    # MAX_STEPS = 3000
+    train_en_sents = train_en_sents[:1000]
+    train_ru_sents = train_ru_sents[:1000]
+    val_en_sents = val_en_sents[:200]
+    val_ru_sents = val_ru_sents[:200]
     
-    # train_en_tok = tokenize_and_pad(train_en_sents, vocab, MAX_LEN)
-    # train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, MAX_LEN)
-    # val_en_tok = tokenize_and_pad(val_en_sents, vocab, MAX_LEN)
-    # val_ru_tok = tokenize_and_pad(val_ru_sents, vocab, MAX_LEN)
+    train_en_tok = tokenize_and_pad(train_en_sents, vocab, MAX_LEN)
+    train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, MAX_LEN)
+    val_en_tok = tokenize_and_pad(val_en_sents, vocab, MAX_LEN)
+    val_ru_tok = tokenize_and_pad(val_ru_sents, vocab, MAX_LEN)
 
     # # --- Synthetic Copy Task ---
-    toy_sentences = ["i am happy", "he is good", "they are here", "we are fine"]
-    train_en_sents = toy_sentences
-    train_ru_sents = toy_sentences  # identical targets
+    # toy_sentences = ["i am happy", "he is good", "they are here", "we are fine"]
+    # train_en_sents = toy_sentences
+    # train_ru_sents = toy_sentences  # identical targets
 
-    vocab = {'<PAD>':0, '<UNK>':1, '<EOS>':2, '<SOS>':3,
-            'i':4, 'am':5, 'happy':6, 'he':7, 'is':8, 'good':9,
-            'they':10, 'are':11, 'here':12, 'we':13, 'fine':14}
-    vocab_inv = {v: k for k, v in vocab.items()}
-    vocab_size = len(vocab)
+    # vocab = {'<PAD>':0, '<UNK>':1, '<EOS>':2, '<SOS>':3,
+    #         'i':4, 'am':5, 'happy':6, 'he':7, 'is':8, 'good':9,
+    #         'they':10, 'are':11, 'here':12, 'we':13, 'fine':14}
+    # vocab_inv = {v: k for k, v in vocab.items()}
+    # vocab_size = len(vocab)
 
-    train_en_tok = tokenize_and_pad(train_en_sents, vocab, max_len=8)
-    train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, max_len=8)
-    val_en_tok, val_ru_tok = train_en_tok, train_ru_tok
+    # train_en_tok = tokenize_and_pad(train_en_sents, vocab, max_len=8)
+    # train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, max_len=8)
+    # val_en_tok, val_ru_tok = train_en_tok, train_ru_tok
 
     # import numpy as np
 
