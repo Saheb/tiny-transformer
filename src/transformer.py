@@ -373,7 +373,7 @@ def loss_fn(params, batch_input, batch_targets, vocab, dropout_rate, key, traini
                     **kwargs)
     
     # loss = optax.softmax_cross_entropy_with_integer_labels(logits, dec_target)
-    loss = smoothed_loss(logits, dec_target, vocab)
+    loss = smoothed_loss(logits, dec_target, vocab, smoothing=0.0)
     mask = (batch_targets != vocab['<PAD>'])
     
     return jnp.sum((loss * mask) / (jnp.sum(mask) + 1e-8))
@@ -419,13 +419,13 @@ if __name__ == "__main__":
 
     # Hyperparameters
     MAX_STEPS = 2000
-    D_MODEL = 256
+    D_MODEL = 64
     D_FF = D_MODEL * 4
     DROPOUT_RATE = 0.1
-    N_LAYERS = 4
+    N_LAYERS = 1
     N_HEADS = 8
     LEARNING_RATE = 1e-4
-    BATCH_SIZE = 32
+    BATCH_SIZE = 2
     MAX_LEN = 32
 
     # Testing Hyperparameters
@@ -436,57 +436,44 @@ if __name__ == "__main__":
     # N_LAYERS = 1            # ✅ one encoder, one decoder
     # N_HEADS = 4             # ✅ simpler attention
 
-    
-    print(f"""
-    --- Model Hyperparameters ---
-    Max Steps:              {MAX_STEPS}
-    Model Dim (d_model):    {D_MODEL}
-    FFN Dim (d_ff):         {D_FF}
-    Dropout Rate:           {DROPOUT_RATE}
-    Encoder/Decoder Layers: {N_LAYERS}
-    Attention Heads:        {N_HEADS}
-    Learning Rate:          {LEARNING_RATE}
-    Batch Size:             {BATCH_SIZE}
-    ---------------------------
-    """)
 
     # --- Setup ---
     key = jax.random.PRNGKey(42)
     key, data_key, params_key = jax.random.split(key, 3)
     
-    vocab, en_sentences, ru_sentences, vocab_size = load_dataset_and_vocab(max_vocab_size=20000)
-    ru_sentences = en_sentences.copy()
+    # vocab, en_sentences, ru_sentences, vocab_size = load_dataset_and_vocab(max_vocab_size=20000)
+    # ru_sentences = en_sentences.copy()
     
-    train_size = int(0.8 * len(en_sentences))
-    train_en_sents, val_en_sents = en_sentences[:train_size], en_sentences[train_size:]
-    train_ru_sents, val_ru_sents = ru_sentences[:train_size], ru_sentences[train_size:]
+    # train_size = int(0.8 * len(en_sentences))
+    # train_en_sents, val_en_sents = en_sentences[:train_size], en_sentences[train_size:]
+    # train_ru_sents, val_ru_sents = ru_sentences[:train_size], ru_sentences[train_size:]
 
-    # testing
-    # MAX_STEPS = 3000
-    train_en_sents = train_en_sents[:1000]
-    train_ru_sents = train_ru_sents[:1000]
-    val_en_sents = val_en_sents[:200]
-    val_ru_sents = val_ru_sents[:200]
+    # # testing
+    # # MAX_STEPS = 3000
+    # train_en_sents = train_en_sents[:1000]
+    # train_ru_sents = train_ru_sents[:1000]
+    # val_en_sents = val_en_sents[:200]
+    # val_ru_sents = val_ru_sents[:200]
     
-    train_en_tok = tokenize_and_pad(train_en_sents, vocab, MAX_LEN)
-    train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, MAX_LEN)
-    val_en_tok = tokenize_and_pad(val_en_sents, vocab, MAX_LEN)
-    val_ru_tok = tokenize_and_pad(val_ru_sents, vocab, MAX_LEN)
+    # train_en_tok = tokenize_and_pad(train_en_sents, vocab, MAX_LEN)
+    # train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, MAX_LEN)
+    # val_en_tok = tokenize_and_pad(val_en_sents, vocab, MAX_LEN)
+    # val_ru_tok = tokenize_and_pad(val_ru_sents, vocab, MAX_LEN)
 
     # # --- Synthetic Copy Task ---
-    # toy_sentences = ["i am happy", "he is good", "they are here", "we are fine"]
-    # train_en_sents = toy_sentences
-    # train_ru_sents = toy_sentences  # identical targets
+    toy_sentences = ["i am happy", "he is good", "they are here", "we are fine"]
+    train_en_sents = toy_sentences
+    train_ru_sents = toy_sentences  # identical targets
 
-    # vocab = {'<PAD>':0, '<UNK>':1, '<EOS>':2, '<SOS>':3,
-    #         'i':4, 'am':5, 'happy':6, 'he':7, 'is':8, 'good':9,
-    #         'they':10, 'are':11, 'here':12, 'we':13, 'fine':14}
-    # vocab_inv = {v: k for k, v in vocab.items()}
-    # vocab_size = len(vocab)
+    vocab = {'<PAD>':0, '<UNK>':1, '<EOS>':2, '<SOS>':3,
+            'i':4, 'am':5, 'happy':6, 'he':7, 'is':8, 'good':9,
+            'they':10, 'are':11, 'here':12, 'we':13, 'fine':14}
+    vocab_inv = {v: k for k, v in vocab.items()}
+    vocab_size = len(vocab)
 
-    # train_en_tok = tokenize_and_pad(train_en_sents, vocab, max_len=8)
-    # train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, max_len=8)
-    # val_en_tok, val_ru_tok = train_en_tok, train_ru_tok
+    train_en_tok = tokenize_and_pad(train_en_sents, vocab, max_len=8)
+    train_ru_tok = tokenize_and_pad(train_ru_sents, vocab, max_len=8)
+    val_en_tok, val_ru_tok = train_en_tok, train_ru_tok
 
     # import numpy as np
 
@@ -508,6 +495,18 @@ if __name__ == "__main__":
     # val_en_tok = jnp.array(inputs[1600:])
     # val_ru_tok = jnp.array(targets[1600:])
     
+    print(f"""
+    --- Model Hyperparameters ---
+    Max Steps:              {MAX_STEPS}
+    Model Dim (d_model):    {D_MODEL}
+    FFN Dim (d_ff):         {D_FF}
+    Dropout Rate:           {DROPOUT_RATE}
+    Encoder/Decoder Layers: {N_LAYERS}
+    Attention Heads:        {N_HEADS}
+    Learning Rate:          {LEARNING_RATE}
+    Batch Size:             {BATCH_SIZE}
+    ---------------------------
+    """)
     
     def lr_schedule(step, base_lr=3e-4, warmup=1000):
         step = jnp.maximum(1, step)
@@ -546,9 +545,9 @@ if __name__ == "__main__":
         new_params = optax.apply_updates(params, updates)
 
         # compute lr for logging: schedule returns a jnp scalar
-        lr = schedule(opt_state.count)
+        # lr = schedule(opt_state.count)
 
-        return new_params, new_opt_state, loss, new_key, global_step + 1, lr
+        return new_params, new_opt_state, loss, new_key, global_step + 1
     
     # @jax.jit
     def eval_step(params, batch_input, batch_targets):
@@ -576,7 +575,7 @@ if __name__ == "__main__":
 
         # print("Sample target:", batch_targets[0])
 
-        params, opt_state, loss, key, global_step, lr = train_step(
+        params, opt_state, loss, key, global_step = train_step(
             params, opt_state, batch_input, batch_targets, train_key, global_step, vocab
         )
 
@@ -610,7 +609,7 @@ if __name__ == "__main__":
 
             pbar.set_postfix({
                 "Step": step + 1,
-                "LR": f"{float(lr):.6f}",
+                # "LR": f"{float(lr):.6f}",
                 "Train Loss": f"{float(loss):.4f}",
                 "Val Accuracy": f"{float(avg_val_accuracy):.4f}"
             })
